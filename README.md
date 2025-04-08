@@ -1,4 +1,4 @@
-# Simulation de Robots sur une Carte Générée par Bruit de Perlin 
+# Simulation de Robots
 ## Antoine Granier Dany Derensy
 
 Ce projet consiste en une simulation de robots évoluant sur une carte générée de manière procédurale à l'aide du bruit de Perlin. La simulation intègre plusieurs fonctionnalités dont :
