@@ -4,7 +4,7 @@ use ratatui::{
     backend::CrosstermBackend,
     prelude::*,
     style::{Color, Modifier, Style},
-    text::Span,
+    text::{Span},
     widgets::*,
 };
 use std::collections::HashSet;
@@ -16,8 +16,8 @@ use std::sync::{
 use std::thread;
 use std::time::Duration;
 
-const MAX_LOGS: usize = 10;
 const MAX_INVENTORY: u32 = 5;
+const MAX_LOGS: usize = 10;
 
 fn log_event(logs: &Arc<Mutex<Vec<String>>>, msg: &str) {
     let mut logs = logs.lock().unwrap();
@@ -27,7 +27,12 @@ fn log_event(logs: &Arc<Mutex<Vec<String>>>, msg: &str) {
     }
 }
 
-#[derive(Debug, Clone)]
+#[derive(Debug, Clone, Copy, PartialEq)]
+enum RobotType {
+    Explorer,
+    Miner,
+}
+
 struct Map {
     width: usize,
     height: usize,
@@ -40,7 +45,9 @@ impl Map {
     fn new(width: usize, height: usize, seed: u32) -> Self {
         let perlin = Perlin::new(seed);
         let mut data = vec![vec!['.'; width]; height];
+        let mut rng = rand::thread_rng();
 
+        // Génération du terrain avec du bruit de Perlin
         for y in 0..height {
             for x in 0..width {
                 let noise_value = perlin.get([x as f64 / 10.0, y as f64 / 10.0]);
@@ -50,16 +57,21 @@ impl Map {
             }
         }
 
+        // Position de la base au centre de la carte
         let base_x = width / 2;
         let base_y = height / 2;
         data[base_y][base_x] = 'S';
 
-        let mut rng = rand::thread_rng();
-        for _ in 0..10 {
+        // Placement aléatoire des ressources sur les cases vides
+        let mut resource_positions = Vec::new();
+        let max_resources = (width * height) / 10;
+        while resource_positions.len() < max_resources {
             let x = rng.gen_range(0..width);
             let y = rng.gen_range(0..height);
             if data[y][x] == '.' {
-                data[y][x] = if rng.gen_bool(0.5) { 'M' } else { 'E' };
+                resource_positions.push((x, y));
+                let resource_type = rng.gen_range(0..2);
+                data[y][x] = if resource_type == 0 { 'M' } else { 'E' };
             }
         }
 
@@ -72,8 +84,8 @@ impl Map {
         }
     }
 
-    fn clone_map(&self) -> Map {
-        Self {
+    pub fn clone_map(&self) -> Map {
+        Map {
             width: self.width,
             height: self.height,
             data: self.data.clone(),
@@ -83,21 +95,15 @@ impl Map {
     }
 }
 
-#[derive(Debug, Clone)]
-enum RobotType {
-    Explorer,
-    Miner,
-}
-
-#[derive(Debug, Clone)]
+#[derive(Clone)]
 struct Robot {
     id: usize,
     x: usize,
     y: usize,
     robot_type: RobotType,
-    inventory: u32,
+    inventory: u32,                
     target: Option<(usize, usize)>,
-    paused: bool,
+    paused: bool,                  
 }
 
 impl Robot {
@@ -113,6 +119,7 @@ impl Robot {
         }
     }
 
+    /// Déplacement aléatoire en respectant les obstacles.
     fn move_randomly(&mut self, width: usize, height: usize, map: &Map) {
         let mut rng = rand::thread_rng();
         let directions = [(-1, 0), (1, 0), (0, -1), (0, 1)];
@@ -125,6 +132,7 @@ impl Robot {
         }
     }
 
+    /// Déplacement d'un pas vers la cible en évitant les obstacles.
     fn move_towards(&mut self, target: (usize, usize), map: &Map) {
         let (target_x, target_y) = target;
         let mut new_x = self.x;
@@ -139,6 +147,7 @@ impl Robot {
         } else if self.y > target_y {
             new_y -= 1;
         }
+
         if map.data[new_y][new_x] != '#' {
             self.x = new_x;
             self.y = new_y;
@@ -157,23 +166,24 @@ impl Robot {
             RobotType::Explorer => {
                 let tile = map.data[self.y][self.x];
                 if tile == 'M' || tile == 'E' {
-                    let mut rep = reported_resources.lock().unwrap();
-                    rep.insert((self.x, self.y));
+                    {
+                        let mut rep = reported_resources.lock().unwrap();
+                        rep.insert((self.x, self.y));
+                    }
                     log_event(
                         logs,
-                        &format!(
-                            "Explorer a trouvé une ressource en ({}, {})",
-                            self.x, self.y
-                        ),
+                        &format!("Ressource trouvée par l'explorateur en ({}, {})", self.x, self.y),
                     );
                 }
                 self.move_randomly(map.width, map.height, map);
             }
             RobotType::Miner => {
                 if self.inventory < MAX_INVENTORY {
+                    // Pour le Miner id 2, rester en pause tant qu'il n'y a pas au moins 2 ressources et aucune cible n'est fixée.
                     if self.id == 2 {
                         let rep = reported_resources.lock().unwrap();
                         if rep.len() < 2 && self.target.is_none() {
+                            // Décaler le robot de 1 pour ne pas masquer la base
                             if self.x == map.base_x && self.y == map.base_y {
                                 if map.base_x + 1 < map.width {
                                     self.x = map.base_x + 1;
@@ -190,6 +200,7 @@ impl Robot {
                             self.paused = false;
                         }
                     }
+                    // S'il n'a pas de cible, en fixer une
                     if self.target.is_none() {
                         let rep = reported_resources.lock().unwrap();
                         if self.id == 2 {
@@ -240,14 +251,12 @@ impl Robot {
                         self.move_randomly(map.width, map.height, map);
                     }
                 } else {
+                    // Inventaire plein : retourner à la base pour vider
                     self.move_towards((map.base_x, map.base_y), map);
                     if self.x == map.base_x && self.y == map.base_y {
                         log_event(
                             logs,
-                            &format!(
-                                "Robot {} vient de se vider (inventaire: {})",
-                                self.id, self.inventory
-                            ),
+                            &format!("Robot {} vient de se vider (inventaire: {})", self.id, self.inventory),
                         );
                         self.inventory = 0;
                     }
@@ -257,6 +266,7 @@ impl Robot {
     }
 }
 
+/// Affichage de la simulation et des logs dans le terminal.
 fn render_ui(
     rx: mpsc::Receiver<Map>,
     robots: Arc<Mutex<Vec<Robot>>>,
@@ -271,7 +281,9 @@ fn render_ui(
 
     while running.load(Ordering::SeqCst) {
         if let Ok(map) = rx.recv_timeout(Duration::from_millis(100)) {
-            let robots_guard = robots.lock().unwrap();
+            let robots_guard = robots.lock().expect("Erreur lors du verrouillage des robots");
+
+            // Construire l'affichage de la carte
             let mut sim_lines: Vec<Line> = Vec::with_capacity(map.height);
             for y in 0..map.height {
                 let mut spans: Vec<Span> = Vec::with_capacity(map.width);
@@ -279,27 +291,24 @@ fn render_ui(
                     let mut ch = map.data[y][x];
                     let mut style = match ch {
                         '#' => Style::default().fg(Color::DarkGray),
-                        'S' => Style::default()
-                            .fg(Color::Blue)
-                            .add_modifier(Modifier::BOLD),
+                        'S' => Style::default().fg(Color::Blue).add_modifier(Modifier::BOLD),
                         'M' | 'E' => Style::default().fg(Color::Yellow),
                         '.' => Style::default().fg(Color::White),
                         _ => Style::default(),
                     };
+
                     for robot in robots_guard.iter() {
                         if robot.x == x && robot.y == y {
-                            ch = match robot.robot_type {
-                                RobotType::Explorer => 'X',
-                                RobotType::Miner => 'R',
-                            };
-                            style = match robot.robot_type {
-                                RobotType::Explorer => Style::default()
-                                    .fg(Color::Green)
-                                    .add_modifier(Modifier::BOLD),
-                                RobotType::Miner => Style::default()
-                                    .fg(Color::Magenta)
-                                    .add_modifier(Modifier::BOLD),
-                            };
+                            match robot.robot_type {
+                                RobotType::Explorer => {
+                                    ch = 'X';
+                                    style = Style::default().fg(Color::Green).add_modifier(Modifier::BOLD);
+                                }
+                                RobotType::Miner => {
+                                    ch = 'R';
+                                    style = Style::default().fg(Color::Magenta).add_modifier(Modifier::BOLD);
+                                }
+                            }
                             break;
                         }
                     }
@@ -308,6 +317,7 @@ fn render_ui(
                 sim_lines.push(Line::from(spans));
             }
 
+            // Récupérer les derniers logs
             let log_lines: Vec<Line> = {
                 let logs_lock = logs.lock().unwrap();
                 logs_lock
@@ -316,6 +326,7 @@ fn render_ui(
                     .collect()
             };
 
+            // Division de l'écran en deux blocs : simulation et logs
             let chunks = Layout::default()
                 .direction(Direction::Vertical)
                 .constraints([Constraint::Percentage(70), Constraint::Percentage(30)].as_ref())
@@ -324,7 +335,7 @@ fn render_ui(
             let sim_paragraph = Paragraph::new(sim_lines)
                 .block(Block::default().borders(Borders::ALL).title("Simulation"));
             let log_paragraph = Paragraph::new(log_lines)
-                .block(Block::default().borders(Borders::ALL).title("Logs"));
+                .block(Block::default().borders(Borders::ALL).title("Récapitulatif"));
 
             terminal.draw(|frame| {
                 frame.render_widget(sim_paragraph, chunks[0]);
@@ -344,57 +355,78 @@ fn main() -> io::Result<()> {
     })
     .expect("Erreur lors de la configuration du handler Ctrl-C");
 
-    // Map
+    // Initialisation de la carte et de la position de la base.
     let initial_map = Map::new(150, 50, 42);
     let base_x = initial_map.base_x;
     let base_y = initial_map.base_y;
     let map = Arc::new(Mutex::new(initial_map));
 
-    let robots = Arc::new(Mutex::new(vec![
+    // Tous les robots démarrent depuis la base.
+    let robots: Vec<_> = vec![
         Robot::new(0, base_x, base_y, RobotType::Explorer),
         Robot::new(1, base_x, base_y, RobotType::Miner),
         Robot::new(2, base_x, base_y, RobotType::Miner),
-    ]));
+    ];
+    let robots_shared = Arc::new(Mutex::new(robots));
 
     let reported_resources = Arc::new(Mutex::new(HashSet::new()));
     let logs = Arc::new(Mutex::new(Vec::new()));
 
     let (tx, rx) = mpsc::channel();
+    let map_shared = Arc::clone(&map);
+    let mut handles = vec![];
 
-    // Robots
     for i in 0..3 {
-        let map_shared = Arc::clone(&map);
+        let map_shared = Arc::clone(&map_shared);
         let tx_clone = tx.clone();
-        let robots_shared = Arc::clone(&robots);
+        let robots_shared_clone = Arc::clone(&robots_shared);
         let running_clone = Arc::clone(&running);
         let reported_resources_clone = Arc::clone(&reported_resources);
         let logs_clone = Arc::clone(&logs);
 
-        thread::spawn(move || {
+        let handle = thread::spawn(move || {
             while running_clone.load(Ordering::SeqCst) {
                 {
-                    let mut map = map_shared.lock().unwrap();
-                    let mut robots = robots_shared.lock().unwrap();
+                    let mut map = match map_shared.lock() {
+                        Ok(guard) => guard,
+                        Err(e) => {
+                            eprintln!("Erreur de verrouillage de la carte : {}", e);
+                            break;
+                        }
+                    };
+                    let mut robots = match robots_shared_clone.lock() {
+                        Ok(guard) => guard,
+                        Err(e) => {
+                            eprintln!("Erreur de verrouillage des robots : {}", e);
+                            break;
+                        }
+                    };
+
                     let mut robot = robots[i].clone();
                     robot.perform_task(&mut map, &reported_resources_clone, &logs_clone);
                     robots[i] = robot.clone();
-                    let _ = tx_clone.send(map.clone_map());
+
+                    if let Err(e) = tx_clone.send(map.clone_map()) {
+                        eprintln!("Erreur lors de l'envoi d'une mise à jour : {}", e);
+                    }
                 }
                 thread::sleep(Duration::from_millis(100));
             }
         });
+        handles.push(handle);
     }
 
-    // UI
-    let robots_ui = Arc::clone(&robots);
     let running_ui = Arc::clone(&running);
-    let logs_ui = Arc::clone(&logs);
     let ui_handle = thread::spawn(move || {
-        if let Err(e) = render_ui(rx, robots_ui, running_ui, logs_ui) {
+        if let Err(e) = render_ui(rx, robots_shared, running_ui, logs) {
             eprintln!("Erreur dans l'UI : {}", e);
         }
     });
 
-    ui_handle.join().unwrap();
+    for handle in handles {
+        handle.join().expect("Le thread robot a paniqué");
+    }
+    ui_handle.join().expect("Le thread UI a paniqué");
+
     Ok(())
 }
