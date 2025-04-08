@@ -1,0 +1,11 @@
+[package]
+name = "rust_robot"
+version = "0.1.0"
+edition = "2021"
+
+[dependencies]
+ratatui = "0.23"
+noise = "0.8"
+rand = "0.8"
+ctrlc = "3.2"
+
