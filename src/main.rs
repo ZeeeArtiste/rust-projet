@@ -1,8 +1,10 @@
 use noise::{NoiseFn, Perlin};
 use rand::Rng;
-use std::collections::HashSet;
 use std::io;
-use std::sync::{Arc, Mutex};
+use std::sync::atomic::{AtomicBool, Ordering};
+use std::sync::{mpsc, Arc, Mutex};
+use std::thread;
+use std::time::Duration;
 
 const MAX_LOGS: usize = 10;
 const MAX_INVENTORY: u32 = 5;
@@ -15,7 +17,7 @@ fn log_event(logs: &Arc<Mutex<Vec<String>>>, msg: &str) {
     }
 }
 
-#[derive(Debug)]
+#[derive(Debug, Clone)]
 struct Map {
     width: usize,
     height: usize,
@@ -42,13 +44,12 @@ impl Map {
         let base_y = height / 2;
         data[base_y][base_x] = 'S';
 
-        // Ajout quelques ressources de test sur des cases vides
+        // Ajout de quelques ressources pour le test.
         let mut rng = rand::thread_rng();
         for _ in 0..10 {
             let x = rng.gen_range(0..width);
             let y = rng.gen_range(0..height);
             if data[y][x] == '.' {
-                // On alterne entre deux types de ressources
                 data[y][x] = if rng.gen_bool(0.5) { 'M' } else { 'E' };
             }
         }
@@ -70,13 +71,13 @@ impl Map {
     }
 }
 
-#[derive(Debug)]
+#[derive(Debug, Clone)]
 enum RobotType {
     Explorer,
     Miner,
 }
 
-#[derive(Debug)]
+#[derive(Debug, Clone)]
 struct Robot {
     id: usize,
     x: usize,
@@ -87,7 +88,13 @@ struct Robot {
 
 impl Robot {
     fn new(id: usize, x: usize, y: usize, robot_type: RobotType) -> Self {
-        Self { id, x, y, robot_type, inventory: 0 }
+        Self {
+            id,
+            x,
+            y,
+            robot_type,
+            inventory: 0,
+        }
     }
 
     fn move_randomly(&mut self, width: usize, height: usize, map: &Map) {
@@ -127,19 +134,22 @@ impl Robot {
     fn perform_task(&mut self, map: &mut Map, logs: &Arc<Mutex<Vec<String>>>) {
         match self.robot_type {
             RobotType::Explorer => {
-                // Si le robot se trouve sur une ressource, la signaler.
                 let tile = map.data[self.y][self.x];
                 if tile == 'M' || tile == 'E' {
-                    log_event(logs, &format!("Explorer a trouvé une ressource en ({}, {})", self.x, self.y));
+                    log_event(
+                        logs,
+                        &format!(
+                            "Explorer {} a trouvé une ressource en ({}, {})",
+                            self.id, self.x, self.y
+                        ),
+                    );
                 }
                 self.move_randomly(map.width, map.height, map);
             }
             RobotType::Miner => {
-                // Pour l'instant, le Miner se contente de se déplacer.
                 if self.inventory < MAX_INVENTORY {
                     self.move_randomly(map.width, map.height, map);
                 } else {
-                    // S'il est plein, retourner à la base
                     self.move_towards((map.base_x, map.base_y), map);
                     if self.x == map.base_x && self.y == map.base_y {
                         log_event(logs, &format!("Miner {} se vide à la base", self.id));
@@ -152,32 +162,52 @@ impl Robot {
 }
 
 fn main() -> io::Result<()> {
-    // Création d'une carte et affichage dans la console
-    let mut map = Map::new(80, 30, 42);
-    println!("Carte initiale :");
-    map.print();
-
-    // Initialisation d'une liste de robots
+    let running = Arc::new(AtomicBool::new(true));
+    let map = Arc::new(Mutex::new(Map::new(80, 30, 42)));
     let logs = Arc::new(Mutex::new(Vec::new()));
-    let mut robots = vec![
-        Robot::new(0, map.base_x, map.base_y, RobotType::Explorer),
-        Robot::new(1, map.base_x, map.base_y, RobotType::Miner),
-    ];
+    let robots = Arc::new(Mutex::new(vec![
+        Robot::new(
+            0,
+            map.lock().unwrap().base_x,
+            map.lock().unwrap().base_y,
+            RobotType::Explorer,
+        ),
+        Robot::new(
+            1,
+            map.lock().unwrap().base_x,
+            map.lock().unwrap().base_y,
+            RobotType::Miner,
+        ),
+    ]));
+    let (tx, rx) = mpsc::channel();
 
-    // Simulation d'une étape : chaque robot exécute sa tâche
-    for robot in robots.iter_mut() {
-        robot.perform_task(&mut map, &logs);
+    // Démarrage d'un thread par robot
+    for i in 0..2 {
+        let map_clone = Arc::clone(&map);
+        let robots_clone = Arc::clone(&robots);
+        let tx_clone = tx.clone();
+        let logs_clone = Arc::clone(&logs);
+        let running_clone = Arc::clone(&running);
+        thread::spawn(move || {
+            while running_clone.load(Ordering::SeqCst) {
+                {
+                    let mut map_lock = map_clone.lock().unwrap();
+                    let mut robots_lock = robots_clone.lock().unwrap();
+                    robots_lock[i].perform_task(&mut map_lock, &logs_clone);
+                    let _ = tx_clone.send(map_lock.clone());
+                }
+                thread::sleep(Duration::from_millis(200));
+            }
+        });
     }
 
-    println!("\nCarte après une étape de simulation :");
-    map.print();
-
-    // Affichage des logs enregistrés
-    println!("\nLogs :");
-    let logs_lock = logs.lock().unwrap();
-    for log in logs_lock.iter() {
-        println!("{}", log);
+    for _ in 0..10 {
+        if let Ok(updated_map) = rx.recv_timeout(Duration::from_millis(500)) {
+            println!("\n=== Mise à jour de la carte ===");
+            updated_map.print();
+        }
     }
 
+    running.store(false, Ordering::SeqCst);
     Ok(())
 }
